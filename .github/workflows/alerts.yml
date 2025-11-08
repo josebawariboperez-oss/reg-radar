@@ -2,8 +2,25 @@ name: alerts-daily
 
 on:
   schedule:
-    - cron: "30 7 * * *"   # 07:30 UTC, después de ingest (06:00) y enrich (07:00)
-  workflow_dispatch: {}
+    - cron: "30 7 * * *"   # 07:30 UTC (después de ingest 06:00 y enrich 07:00)
+  workflow_dispatch:
+    inputs:
+      country:
+        description: "Filtro de país (Qatar / KSA / UAE). Déjalo vacío para global."
+        required: false
+        default: ""
+        type: string
+      overrides:
+        description: "Umbrales por autoridad, ej.: PSA=48,Open Data Portal=96"
+        required: false
+        default: ""
+        type: string
+      only_if_issues:
+        description: "Enviar email solo si hay problemas (fuentes silenciosas o fallos)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
 
 env:
   PYTHONUNBUFFERED: "1"
@@ -13,13 +30,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Health alerts
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -28,4 +48,25 @@ jobs:
           MAILGUN_DOMAIN: ${{ secrets.MAILGUN_DOMAIN }}
           ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
         run: |
-          python alerts.py --min-silence-hours 72 --since-hours 48
+          # Construir flags desde inputs (vacíos si no se pasan)
+          COUNTRY_INPUT="${{ github.event.inputs.country }}"
+          OVERRIDES_INPUT="${{ github.event.inputs.overrides }}"
+          ONLY_IF_ISSUES="${{ github.event.inputs.only_if_issues }}"
+
+          # Ejecutar en modo normal (envía correo)
+          python alerts.py \
+            --country "${COUNTRY_INPUT}" \
+            --min-silence-hours 72 \
+            --silence-overrides "${OVERRIDES_INPUT}" \
+          | tee alerts_output.txt
+
+          # Si se eligió "solo si hay issues", filtramos el envío:
+          if [ "${ONLY_IF_ISSUES}" = "true" ]; then
+            # Buscamos contadores en la salida
+            SILENT_COUNT=$(grep -E "^3\) Silent sources" alerts_output.txt | grep -oE ":\s*[0-9]+" | tr -d " :")
+            FAILS_COUNT=$(grep -E "^2\) Failed runs" alerts_output.txt | grep -oE ":\s*[0-9]+" | tr -d " :")
+            if [ "${SILENT_COUNT}" = "0" ] && [ "${FAILS_COUNT}" = "0" ]; then
+              echo "No hay issues: se omite email (only_if_issues=true)."
+              exit 0
+            fi
+          fi
