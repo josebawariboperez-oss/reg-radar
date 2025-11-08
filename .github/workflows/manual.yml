@@ -1,0 +1,62 @@
+name: manual-run
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Job a ejecutar"
+        required: true
+        default: "ingest"
+        type: choice
+        options: [ingest, enrich]
+      country:
+        description: "País (ej. Qatar)"
+        required: false
+        default: "Qatar"
+        type: string
+      limit:
+        description: "Límite"
+        required: false
+        default: "20"
+        type: string
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  ingest:
+    if: github.event.inputs.job == 'ingest'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Ingest
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python run_save.py --country "${{ github.event.inputs.country }}" --limit ${{ github.event.inputs.limit }}
+
+  enrich:
+    if: github.event.inputs.job == 'enrich'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Enrich
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
+        run: |
+          python enrich.py --limit ${{ github.event.inputs.limit }}
