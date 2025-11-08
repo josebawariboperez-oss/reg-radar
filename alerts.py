@@ -1,15 +1,14 @@
+# alerts.py
 import os
 import sys
 import argparse
 from datetime import datetime, timezone, timedelta
+from collections import OrderedDict
 
 from dotenv import load_dotenv
 import httpx
 from supabase import create_client, Client
 
-# -------------------------
-# Config & helpers
-# -------------------------
 load_dotenv()
 
 REQUIRED_ENV = [
@@ -20,6 +19,9 @@ REQUIRED_ENV = [
     "ALERT_TO_EMAIL",
 ]
 
+# -------------------------
+# Helpers
+# -------------------------
 def require_env():
     missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
     if missing:
@@ -36,18 +38,41 @@ def utcnow():
 def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
 
+def parse_overrides(s: str | None) -> dict[str, int]:
+    """
+    Convierte 'PSA=48,Open Data Portal=96' -> {'PSA':48, 'Open Data Portal':96}
+    """
+    if not s:
+        return {}
+    out: dict[str, int] = {}
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        if "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        k = k.strip()
+        try:
+            out[k] = int(v.strip())
+        except ValueError:
+            pass
+    return out
+
 # -------------------------
 # Checks
 # -------------------------
-def check_pending_enrich(supa: Client) -> int:
-    # cuantos ingest_items quedan por enriquecer
-    r = supa.table("ingest_items").select("id", count="exact").is_("enriched_at", "null").execute()
-    return r.count or 0
+def check_pending_enrich(supa: Client, country: str | None) -> int:
+    q = supa.table("ingest_items").select("id", count="exact").is_("enriched_at", "null")
+    if country:
+        q = q.eq("country", country)
+    res = q.execute()
+    return res.count or 0
 
 def check_failed_runs(supa: Client, since_hours: int = 48) -> list[dict]:
+    """
+    runs_log no tiene campo country; el chequeo es global.
+    """
     since = utcnow() - timedelta(hours=since_hours)
-    # runs con fallos recientes
-    r = (
+    res = (
         supa.table("runs_log")
         .select("run_type, started_at, finished_at, ok_count, fail_count, notes")
         .gte("started_at", since.isoformat())
@@ -55,42 +80,66 @@ def check_failed_runs(supa: Client, since_hours: int = 48) -> list[dict]:
         .order("started_at", desc=True)
         .execute()
     )
-    return r.data or []
+    return res.data or []
 
-def check_silent_sources(supa: Client, min_silence_hours: int = 72) -> list[dict]:
+def check_silent_sources(
+    supa: Client,
+    min_silence_hours_default: int,
+    silence_overrides: dict[str, int],
+    country: str | None,
+    max_rows: int = 50000,
+) -> list[dict]:
     """
-    Fuentes (authority, source_url) sin nuevos items desde hace > min_silence_hours.
-    Calculamos MAX(created_at) en ingest_items por authority/source_url.
+    Calcula la última vez que cada (authority, source_url) generó un item.
+    Como el cliente no soporta group-by, ordenamos por authority, source_url,
+    created_at DESC y nos quedamos con la primera aparición de cada par.
+    Aplica overrides por 'authority' si existen.
     """
-    cutoff = utcnow() - timedelta(hours=min_silence_hours)
-
-    # Aggregation con PostgREST: select=authority,source_url,max_created_at:created_at.max()
-    r = (
+    # Traemos filas (filtradas por país si aplica), ordenadas para quedarnos con el último de cada par.
+    q = (
         supa.table("ingest_items")
-        .select("authority,source_url,max_created_at:created_at.max()")
-        .group("authority,source_url")
-        .execute()
+        .select("country,authority,source_url,created_at")
+        .order("authority")
+        .order("source_url")
+        .order("created_at", desc=True)
+        .limit(max_rows)
     )
-    rows = r.data or []
+    if country:
+        q = q.eq("country", country)
+    res = q.execute()
+    rows = res.data or []
 
-    silent = []
-    for row in rows:
-        max_created_at = row.get("max_created_at")
-        # Si la fuente jamás ingresó items, no aparecerá aquí; para cobertura total,
-        # podríamos LEFT JOIN con coverage, pero esto basta para alertar inactividad real.
-        if not max_created_at:
+    latest_by_source: "OrderedDict[tuple[str,str,str], datetime]" = OrderedDict()
+    for r in rows:
+        key = (r.get("country"), r.get("authority"), r.get("source_url"))
+        if not key[0] or not key[1] or not key[2]:
+            continue
+        if key in latest_by_source:
+            continue  # ya tenemos el más reciente por el orden DESC
+        ts = r.get("created_at")
+        if not ts:
             continue
         try:
-            last_dt = datetime.fromisoformat(max_created_at.replace("Z", "+00:00"))
+            last_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         except Exception:
             continue
+        latest_by_source[key] = last_dt
+
+    now = utcnow()
+    silent = []
+    for (ctry, authority, src_url), last_dt in latest_by_source.items():
+        # Umbral por autoridad (override) o global
+        hours_threshold = silence_overrides.get(authority, min_silence_hours_default)
+        cutoff = now - timedelta(hours=hours_threshold)
         if last_dt < cutoff:
             silent.append(
                 {
-                    "authority": row.get("authority"),
-                    "source_url": row.get("source_url"),
+                    "country": ctry,
+                    "authority": authority,
+                    "source_url": src_url,
                     "last_item_at": last_dt.isoformat(),
-                    "hours_since": round((utcnow() - last_dt).total_seconds() / 3600, 1),
+                    "hours_since": round((now - last_dt).total_seconds() / 3600, 1),
+                    "threshold_h": hours_threshold,
                 }
             )
     return silent
@@ -129,24 +178,40 @@ def send_mail(subject: str, text: str, html: str | None = None, dry_run: bool = 
 # -------------------------
 def main():
     parser = argparse.ArgumentParser(description="Alertas de salud del pipeline")
-    parser.add_argument("--min-silence-hours", type=int, default=72, help="Umbral de inactividad por fuente")
-    parser.add_argument("--since-hours", type=int, default=48, help="Ventana para buscar runs fallidos")
+    parser.add_argument("--country", type=str, default=None, help="Filtra por país (ej. Qatar, KSA, UAE)")
+    parser.add_argument("--min-silence-hours", type=int, default=72, help="Umbral global de inactividad por fuente")
+    parser.add_argument(
+        "--silence-overrides",
+        type=str,
+        default=None,
+        help="Overrides por autoridad, ej.: 'PSA=48,Open Data Portal=96'",
+    )
+    parser.add_argument("--since-hours", type=int, default=48, help="Ventana para runs fallidos (global)")
     parser.add_argument("--dry-run", action="store_true", help="No envía email, solo imprime")
     args = parser.parse_args()
 
     require_env()
     supa = sb()
 
-    pending = check_pending_enrich(supa)
-    failed = check_failed_runs(supa, since_hours=args.since_hours)
-    silent = check_silent_sources(supa, min_silence_hours=args.min_silence_hours)
+    overrides = parse_overrides(args.silence_overrides)
 
-    # Construir mensaje
+    pending = check_pending_enrich(supa, args.country)
+    failed = check_failed_runs(supa, since_hours=args.since_hours)
+    silent = check_silent_sources(
+        supa,
+        min_silence_hours_default=args.min_silence_hours,
+        silence_overrides=overrides,
+        country=args.country,
+    )
+
     now = fmt_dt(utcnow())
-    lines = [
-        f"GCC Policy & Regulatory Radar — Health Check",
-        f"Timestamp (UTC): {now}",
-        "",
+    header = [f"GCC Policy & Regulatory Radar — Health Check",
+              f"Timestamp (UTC): {now}"]
+    if args.country:
+        header.append(f"Country filter: {args.country}")
+    header.append("")
+
+    lines = header + [
         f"1) Pending to enrich: {pending}",
         f"2) Failed runs (last {args.since_hours}h): {len(failed)}",
     ]
@@ -156,16 +221,24 @@ def main():
             lines.append(
                 f"     • {f['run_type']} | started {f['started_at']} | ok={f['ok_count']} fail={f['fail_count']} | notes={f.get('notes')}"
             )
-    lines.append(f"3) Silent sources (> {args.min_silence_hours}h): {len(silent)}")
+    lines.append(
+        f"3) Silent sources (> {args.min_silence_hours}h; overrides: {', '.join([f'{k}={v}' for k,v in overrides.items()]) or 'none'})"
+        + f": {len(silent)}"
+    )
     if silent:
         lines.append("   - Sources:")
         for s in silent[:25]:
+            country_tag = f"[{s['country']}] " if s.get("country") else ""
             lines.append(
-                f"     • {s['authority']} | {s['source_url']} | last={s['last_item_at']} | ~{s['hours_since']}h"
+                f"     • {country_tag}{s['authority']} | {s['source_url']} | last={s['last_item_at']} | ~{s['hours_since']}h (thr={s['threshold_h']}h)"
             )
 
     body = "\n".join(lines)
-    subject = f"[GCC Radar] Health: pending={pending} | fails={len(failed)} | silent={len(silent)}"
+    subject = (
+        f"[GCC Radar] Health"
+        + (f" [{args.country}]" if args.country else "")
+        + f": pending={pending} | fails={len(failed)} | silent={len(silent)}"
+    )
 
     send_mail(subject=subject, text=body, html=None, dry_run=args.dry_run)
     print("OK - alerta procesada.")
