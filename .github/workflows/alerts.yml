@@ -1,0 +1,31 @@
+name: alerts-daily
+
+on:
+  schedule:
+    - cron: "30 7 * * *"   # 07:30 UTC, después de ingest (06:00) y enrich (07:00)
+  workflow_dispatch: {}
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Health alerts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          MAILGUN_API_KEY: ${{ secrets.MAILGUN_API_KEY }}
+          MAILGUN_DOMAIN: ${{ secrets.MAILGUN_DOMAIN }}
+          ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+        run: |
+          python alerts.py --min-silence-hours 72 --since-hours 48
