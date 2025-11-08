@@ -1,0 +1,14 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local artifacts
+*.csv
+*.log
+
+# Secrets
+.env
+
+# OS
+Thumbs.db

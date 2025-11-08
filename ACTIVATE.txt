@@ -1,0 +1,2 @@
+cd $HOME\Documents\reg-radar
+.\.venv\Scripts\Activate

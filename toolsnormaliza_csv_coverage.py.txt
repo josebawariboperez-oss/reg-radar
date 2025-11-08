@@ -1,0 +1,57 @@
+import csv, re
+from pathlib import Path
+
+IN_CSV = "gcc_sources_v1_3.csv"
+OUT_CSV = "gcc_sources_v1_3_supabase.csv"
+
+def looks_like_url(s: str) -> bool:
+    return bool(s) and bool(re.match(r"^https?://", s.strip(), re.I))
+
+with open(IN_CSV, "r", encoding="utf-8-sig", newline="") as f:
+    rows = list(csv.DictReader(f))
+
+cols = [
+    "country","authority","source_url",
+    "level","source_name","type","format","lang","grade","notes",
+    "rss","rss_url","has_rss",
+    "requires_js","priority","topic_bucket","lang_hint","auth_pattern",
+    "is_active","last_success","last_doc_date",
+]
+
+out = []
+for r in rows:
+    rss_raw = (r.get("rss") or "").strip()
+    rss_url = rss_raw if looks_like_url(rss_raw) else ""
+    has_rss = "true" if (looks_like_url(rss_raw) or rss_raw.lower() in {"yes","sí","si","true","t","1"}) else "false"
+
+    out.append({
+        "country":     (r.get("country") or "").strip(),
+        "authority":   (r.get("authority") or "").strip(),
+        "source_url":  (r.get("source_url") or "").strip(),
+        "level":       (r.get("level") or "").strip(),
+        "source_name": (r.get("source_name") or "").strip(),
+        "type":        (r.get("type") or "").strip(),
+        "format":      (r.get("format") or "").strip(),
+        "lang":        (r.get("lang") or "").strip(),
+        "grade":       (r.get("grade") or "").strip(),
+        "notes":       (r.get("notes") or "").strip(),
+        "rss":         rss_raw,
+        "rss_url":     rss_url,
+        "has_rss":     has_rss,
+        "requires_js": (r.get("requires_js") or "false").strip().lower(),
+        "priority":    (r.get("priority") or "3").strip(),
+        "topic_bucket":(r.get("topic_bucket") or "").strip(),
+        "lang_hint":   (r.get("lang_hint") or "").strip(),
+        "auth_pattern":(r.get("auth_pattern") or "").strip(),
+        "is_active":   (r.get("is_active") or "true").strip().lower(),
+        "last_success": (r.get("last_success") or "").strip(),
+        "last_doc_date":(r.get("last_doc_date") or "").strip(),
+    })
+
+with open(OUT_CSV, "w", encoding="utf-8", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=cols)
+    w.writeheader()
+    for r in out:
+        w.writerow(r)
+
+print("✅ CSV limpio creado:", OUT_CSV)
