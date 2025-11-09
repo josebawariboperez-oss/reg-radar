@@ -12,3 +12,10 @@ __pycache__/
 
 # OS
 Thumbs.db
+CONTRASEÑA SUPABASE.txt
+*.env
+*.env.*
+*.key
+*.pem
+*.crt
+*.p12
